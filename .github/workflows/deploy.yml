@@ -1,0 +1,674 @@
+name: Demo Deploy (Optimized)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Force rebuild all jobs (ignore cache)"
+        required: false
+        default: false
+        type: boolean
+      skip_health_check:
+        description: "Skip final health check"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPO: orbital-freight/podinfo
+  PLATFORM: linux/amd64
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  DOCKER_BUILDKIT: "1"
+  TF_VAR_alarm_email: ${{ vars.ALARM_EMAIL }}
+
+jobs:
+  # ============================================================================
+  # JOB 1: INFRASTRUCTURE BOOTSTRAP (Preparazione backend e ECR)
+  # ============================================================================
+  infrastructure:
+    name: 🏗️ Infrastructure Bootstrap
+    runs-on: ubuntu-latest
+    # Permetti retry automatico su fallimenti di infrastruttura
+    continue-on-error: false
+    outputs:
+      aws-account: ${{ steps.aws-setup.outputs.aws-account }}
+      bucket: ${{ steps.aws-setup.outputs.bucket }}
+      table: ${{ steps.aws-setup.outputs.table }}
+      ecr-uri: ${{ steps.aws-setup.outputs.ecr-uri }}
+      bootstrap-key: ${{ steps.aws-setup.outputs.bootstrap-key }}
+      env-key: ${{ steps.aws-setup.outputs.env-key }}
+      cache-hit: ${{ steps.terraform-cache.outputs.cache-hit }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- Terraform Setup con Cache ----
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.5
+          terraform_wrapper: false
+
+      - name: Cache Terraform Providers
+        id: terraform-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            terraform/10-bootstrap-ci-iam/.terraform
+            ~/.terraform.d/plugin-cache
+          key: terraform-providers-${{ runner.os }}-${{ hashFiles('terraform/10-bootstrap-ci-iam/.terraform.lock.hcl') }}-${{ github.event.inputs.force_rebuild == 'true' && github.run_id || '' }}
+          restore-keys: |
+            terraform-providers-${{ runner.os }}-
+
+      # ---- AWS Setup ----
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 1800 # Aumentato per job più lunghi
+
+      - name: Setup AWS parameters
+        id: aws-setup
+        shell: bash
+        run: |
+          ACC=$(aws sts get-caller-identity --query 'Account' --output text)
+          echo "aws-account=$ACC" >> $GITHUB_OUTPUT
+          echo "bucket=orbital-freight-tf-state-$ACC" >> $GITHUB_OUTPUT
+          echo "table=orbital-freight-tf-locks" >> $GITHUB_OUTPUT
+          echo "bootstrap-key=10-bootstrap-ci-iam/terraform.tfstate" >> $GITHUB_OUTPUT
+          echo "env-key=podinfo/dev/terraform.tfstate" >> $GITHUB_OUTPUT
+          echo "ecr-uri=${ACC}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}" >> $GITHUB_OUTPUT
+
+      # ---- Bootstrap Infrastructure ----
+      - name: Bootstrap backend prerequisites
+        working-directory: terraform/10-bootstrap-ci-iam
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUCKET="${{ steps.aws-setup.outputs.bucket }}"
+          TABLE="${{ steps.aws-setup.outputs.table }}"
+
+          echo "🔍 Checking backend prerequisites..."
+          need_create=0
+          aws s3api head-bucket --bucket "$BUCKET" >/dev/null 2>&1 || need_create=1
+          aws dynamodb describe-table --table-name "$TABLE" >/dev/null 2>&1 || need_create=1
+
+          if [ $need_create -eq 1 ]; then
+            echo "🏗️ Creating backend prerequisites locally..."
+            # Disattiva qualsiasi backend “rimasto attaccato”
+            [ -f backend.tf ] && mv backend.tf backend.tf.bak
+            rm -rf .terraform .terraform.lock.hcl
+            export TF_DATA_DIR="$PWD/.tfdata"; rm -rf "$TF_DATA_DIR"
+            terraform init -reconfigure -backend=false
+            terraform apply -input=false -auto-approve
+            [ -f backend.tf.bak ] && mv backend.tf.bak backend.tf
+            unset TF_DATA_DIR
+            echo "✅ Backend prerequisites created"
+          else
+            echo "✅ Backend prerequisites already exist"
+          fi
+
+      - name: Initialize Terraform with S3 backend
+        working-directory: terraform/10-bootstrap-ci-iam
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "📄 Initializing Terraform with S3 backend..."
+
+            terraform init -migrate-state -force-copy -input=false \
+              -backend-config="bucket=${{ steps.aws-setup.outputs.bucket }}" \
+              -backend-config="key=${{ steps.aws-setup.outputs.bootstrap-key }}" \
+              -backend-config="region=${{ env.AWS_REGION }}" \
+              -backend-config="dynamodb_table=${{ steps.aws-setup.outputs.table }}" \
+              -backend-config="encrypt=true"
+
+      - name: Apply infrastructure changes
+        working-directory: terraform/10-bootstrap-ci-iam
+        run: |
+          echo "🚀 Applying infrastructure changes..."
+          terraform apply -auto-approve
+
+    # ============================================================================
+    # JOB 2: GO LINT & TEST PODINFO
+    # ============================================================================
+
+  lint:
+    name: 📍 Go Lint & Test (Podinfo)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Podinfo source
+        run: |
+          git clone --depth 1 https://github.com/stefanprodan/podinfo.git
+
+      - name: Set up Go (from Podinfo go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          check-latest: true
+
+      - name: Go modules download
+        working-directory: podinfo
+        run: go mod download
+
+      # Solo go vet e test, senza golangci-lint
+      - name: go vet
+        working-directory: podinfo
+        run: go vet ./...
+
+      - name: go test
+        working-directory: podinfo
+        run: go test ./...
+
+      # Opzionale: controllo formato
+      - name: go fmt check
+        working-directory: podinfo
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "Go code is not formatted"
+            gofmt -d .
+            exit 1
+          fi
+
+  # ============================================================================
+  # JOB 2: BUILD & PUSH (Parallel con infrastructure, ma dipende da ECR)
+  # ============================================================================
+  build:
+    name: 🐳 Build & Push Docker
+    runs-on: ubuntu-latest
+    needs: [infrastructure, lint]
+    # Job può fallire senza bloccare altri se l'immagine esiste già
+    continue-on-error: false
+    outputs:
+      image-tag: ${{ github.sha }}
+      image-uri: ${{ needs.infrastructure.outputs.ecr-uri }}:${{ github.sha }}
+      build-skipped: ${{ steps.check-image.outputs.exists }}
+      cache-hit: ${{ steps.docker-cache.outputs.cache-hit }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- Check se l'immagine esiste già (per evitare rebuild non necessari) ----
+      - name: Configure AWS credentials (for image check)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 900
+
+      - name: Check if Docker image already exists
+        id: check-image
+        env:
+          ECR_URI: ${{ needs.infrastructure.outputs.ecr-uri }}
+        run: |
+          set +e  # Non fallire se l'immagine non esiste
+          echo "🔍 Checking if image already exists: ${ECR_URI}:${{ github.sha }}"
+
+          if [ "${{ github.event.inputs.force_rebuild }}" == "true" ]; then
+            echo "🔄 Force rebuild requested, skipping check"
+            echo "exists=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          aws ecr describe-images \
+            --repository-name "${{ env.ECR_REPO }}" \
+            --image-ids imageTag="${{ github.sha }}" \
+            >/dev/null 2>&1
+
+          if [ $? -eq 0 ]; then
+            echo "✅ Image already exists, skipping build"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "🏗️ Image doesn't exist, proceeding with build"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ---- Docker Setup con Cache Avanzato ----
+      - name: Set up Docker Buildx
+        if: steps.check-image.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        id: docker-cache
+        if: steps.check-image.outputs.exists == 'false'
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: docker-buildx-${{ github.sha }}-${{ github.event.inputs.force_rebuild == 'true' && github.run_id || '' }}
+          restore-keys: |
+            docker-buildx-${{ github.ref_name }}-
+            docker-buildx-
+
+      # ---- AWS & ECR Login ----
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ---- Build ottimizzato con cache GitHub Actions ----
+      - name: Build & Push Docker image
+        if: steps.check-image.outputs.exists == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          cache-from: |
+            type=gha
+            type=local,src=/tmp/.buildx-cache
+          cache-to: |
+            type=gha,mode=max
+            type=local,dest=/tmp/.buildx-cache-new,mode=max
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ needs.infrastructure.outputs.ecr-uri }}:${{ github.sha }}
+            ${{ needs.infrastructure.outputs.ecr-uri }}:latest
+
+      - name: Smoke test container
+        if: always()
+        timeout-minutes: 5
+        run: |
+          docker run -d --rm -p 9898:9898 ${{ needs.infrastructure.outputs.ecr-uri }}:${{ github.sha }}
+          for i in {1..10}; do
+            curl -sf http://127.0.0.1:9898/healthz && ok=1 && break
+            sleep 2
+          done
+          [ "${ok:-}" = "1" ] || { echo "healthz failed"; exit 1; }
+
+      # ---- Ottimizzazione cache Docker ----
+      - name: Move Docker cache
+        if: steps.check-image.outputs.exists == 'false'
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      - name: Build Summary
+        run: |
+          if [ "${{ steps.check-image.outputs.exists }}" == "true" ]; then
+            echo "📦 **Docker Build**: Skipped (image already exists)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "📦 **Docker Build**: Completed successfully" >> $GITHUB_STEP_SUMMARY
+            echo "🏷️ **Image**: ${{ needs.infrastructure.outputs.ecr-uri }}:${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ============================================================================
+  # JOB 3: DEPLOY APPLICATION (Dipende da infrastructure + build)
+  # ============================================================================
+  deploy:
+    name: 🚀 Deploy Application
+    runs-on: ubuntu-latest
+    needs: [infrastructure, build]
+    # Permetti retry su fallimenti temporanei
+    continue-on-error: false
+    outputs:
+      service-url: ${{ steps.tf-outputs.outputs.service-url }}
+      lambda-name: ${{ steps.tf-outputs.outputs.lambda-name }}
+      secret-arn: ${{ steps.tf-outputs.outputs.secret-arn }}
+      deployment-skipped: ${{ steps.check-deployment.outputs.skip }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- Terraform Setup con Cache ----
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.5
+          terraform_wrapper: false
+
+      - name: Check deployment decision
+        id: check-deployment
+        shell: bash
+        run: |
+          # Se vuoi saltare il deploy quando l'immagine esiste già:
+          # [ "${{ needs.build.outputs.build-skipped }}" = "true" ] && echo "skip=true" >> $GITHUB_OUTPUT && exit 0
+          echo "skip=false" >> $GITHUB_OUTPUT
+
+      - name: Cache Terraform (env)
+        uses: actions/cache@v4
+        with:
+          path: |
+            terraform/20-envs/dev/.terraform
+            ~/.terraform.d/plugin-cache
+          key: terraform-env-${{ runner.os }}-${{ hashFiles('terraform/20-envs/dev/.terraform.lock.hcl') }}
+          restore-keys: |
+            terraform-env-${{ runner.os }}-
+
+      # ---- AWS Setup ----
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 1200
+
+      - name: Verify backend config (env)
+        working-directory: terraform/20-envs/dev
+        shell: bash
+        run: |
+          BUCKET="${{ needs.infrastructure.outputs.bucket }}"
+          KEY="${{ needs.infrastructure.outputs.env-key }}"
+          TABLE="${{ needs.infrastructure.outputs.table }}"
+          REGION="${{ env.AWS_REGION }}"
+          echo "Using backend bucket=$BUCKET key=$KEY table=$TABLE region=$REGION"
+          if [ -z "$BUCKET" ] || [ -z "$KEY" ] || [ -z "$TABLE" ] || [ -z "$REGION" ]; then
+            echo "❌ Missing backend config!"
+            exit 1
+          fi
+
+      # ---- Deploy Environment ----
+      - name: Initialize Terraform (environment)
+        working-directory: terraform/20-envs/dev
+        run: |
+          echo "🔄 Initializing environment Terraform..."
+
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ needs.infrastructure.outputs.bucket }}" \
+            -backend-config="key=${{ needs.infrastructure.outputs.env-key }}" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ needs.infrastructure.outputs.table }}" \
+            -backend-config="encrypt=true"
+
+      - name: Deploy application
+        working-directory: terraform/20-envs/dev
+        env:
+          TF_VAR_image_uri: ${{ needs.build.outputs.image-uri }}
+        shell: bash
+        run: |
+          echo "🚀 Deploying application with image: ${{ needs.build.outputs.image-uri }}"
+          terraform apply -auto-approve -var "alarm_email=${{ vars.ALARM_EMAIL }}"
+
+          # === Outputs Terraform ===
+            LAMBDA_NAME=$(terraform output -raw lambda_function_name)
+            CD_APP=$(terraform output -raw codedeploy_app)
+            CD_DG=$(terraform output -raw codedeploy_deployment_group)
+
+            echo "Lambda: $LAMBDA_NAME | CD app: $CD_APP | DG: $CD_DG"
+
+            # === Pubblica nuova versione ===
+            NEW_VER=$(aws lambda publish-version --function-name "$LAMBDA_NAME" --query Version --output text)
+            echo "New Lambda version: $NEW_VER"
+
+            # === Assicura che esista l'alias 'live' ===
+            if ! aws lambda get-alias --function-name "$LAMBDA_NAME" --name live >/dev/null 2>&1; then
+              echo "Alias 'live' non esiste: lo creo puntando a $NEW_VER e salto CodeDeploy (bootstrap)..."
+              aws lambda create-alias --function-name "$LAMBDA_NAME" --name live --function-version "$NEW_VER"
+              echo "Bootstrapped alias → niente canary al primo giro."
+              exit 0
+            fi
+
+            # === Leggi versione attuale dell'alias ===
+            CUR_VER=$(aws lambda get-alias --function-name "$LAMBDA_NAME" --name live --query 'FunctionVersion' --output text)
+            echo "Alias 'live' points to: $CUR_VER"
+
+            # Se è $LATEST o vuoto, proviamo a ricavare una versione numerica precedente
+            if [ -z "$CUR_VER" ] || [ "$CUR_VER" = "\$LATEST" ] || [ "$CUR_VER" = "$LATEST" ]; then
+              echo "Alias 'live' punta a \$LATEST o è vuoto. Cerco una versione numerica precedente..."
+              PREV_VER=$(
+                aws lambda list-versions-by-function --function-name "$LAMBDA_NAME" --output json \
+                | jq -r --arg new "$NEW_VER" '
+                    .Versions
+                    | map(select(.Version != "$LATEST") | .Version | tonumber)
+                    | sort
+                    | map(tostring)
+                    | reverse
+                    | .[] | select(. != $new)
+                    | . ' | head -n1 || true
+              )
+
+              if [ -n "${PREV_VER:-}" ]; then
+                CUR_VER="$PREV_VER"
+                echo "Uso versione precedente come CurrentVersion: $CUR_VER"
+              else
+                echo "Nessuna versione precedente trovata. Aggiorno alias a $NEW_VER e salto CodeDeploy."
+                aws lambda update-alias --function-name "$LAMBDA_NAME" --name live --function-version "$NEW_VER"
+                exit 0
+              fi
+            fi
+
+            # === Costruisci AppSpec (stringa) ===
+            APP_SPEC_OBJ=$(jq -nc --arg fn "$LAMBDA_NAME" --arg al "live" --arg cur "$CUR_VER" --arg tgt "$NEW_VER" \
+              '{version:"0.0",
+                Resources:[
+                  { "MyFunction":{
+                      "Type":"AWS::Lambda::Function",
+                      "Properties":{"Name":$fn,"Alias":$al,"CurrentVersion":$cur,"TargetVersion":$tgt}
+                    }}
+                ]}')
+
+            REVISION_JSON=$(printf '%s' "$APP_SPEC_OBJ" | jq -Rs '{revisionType:"AppSpecContent", appSpecContent:{content:.}}')
+
+            # === Crea deployment CodeDeploy ===
+            DEPLOY_ID=$(aws deploy create-deployment \
+              --application-name "$CD_APP" \
+              --deployment-group-name "$CD_DG" \
+              --revision "$REVISION_JSON" \
+              --query deploymentId --output text)
+
+            echo "Created deployment: $DEPLOY_ID"
+
+      # (Opzionale) Attendi l'esito ed esci in errore se rollBacka
+      # aws deploy wait deployment-successful --deployment-id "$DEPLOY_ID"
+
+      - name: Extract Terraform outputs
+        id: tf-outputs
+        working-directory: terraform/20-envs/dev
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "📊 Extracting Terraform outputs..."
+
+          # Debug: mostra tutti gli output
+          terraform output -json | jq '.'
+
+          # Estrai URL del servizio
+          URL=$(terraform output -json | jq -r '.service_url.value // .api_url.value // .invoke_url.value // empty')
+          if [ -z "$URL" ]; then
+            echo "❌ No service URL found in outputs"
+            exit 1
+          fi
+
+          # Estrai altri parametri necessari
+          SECRET_ARN=$(terraform output -raw demo_secret_arn)
+          LAMBDA_NAME=$(terraform output -raw lambda_function_name)
+
+          echo "service-url=$URL" >> $GITHUB_OUTPUT
+          echo "secret-arn=$SECRET_ARN" >> $GITHUB_OUTPUT
+          echo "lambda-name=$LAMBDA_NAME" >> $GITHUB_OUTPUT
+
+          echo "✅ URL: $URL"
+          echo "✅ Secret ARN: $SECRET_ARN"
+          echo "✅ Lambda: $LAMBDA_NAME"
+
+  # ============================================================================
+  # JOB 4: CONFIGURATION & HEALTH CHECK (Finale, dipende da deploy)
+  # ============================================================================
+  finalize:
+    name: ⚙️ Configure & Verify
+    runs-on: ubuntu-latest
+    needs: [infrastructure, build, deploy]
+
+    steps:
+      # ---- AWS Setup ----
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 900
+
+      # ---- Configure Secrets ----
+      - name: Configure application secrets
+        env:
+          SECRET_ARN: ${{ needs.deploy.outputs.secret-arn }}
+        shell: bash
+        run: |
+          set +x  # Non mostrare comandi con segreti
+          echo "🔐 Configuring application secrets..."
+
+          # Genera o usa secret da GitHub Secrets
+          if [ -n "${{ secrets.DEMO_API_KEY }}" ]; then
+            API_KEY="${{ secrets.DEMO_API_KEY }}"
+            echo "Using API key from GitHub Secrets"
+          else
+            API_KEY=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-40)
+            echo "Generated new API key"
+          fi
+
+          echo "::add-mask::$API_KEY"
+
+          # Aggiorna il secret in AWS
+          aws secretsmanager put-secret-value \
+            --secret-id "$SECRET_ARN" \
+            --secret-string "{\"SUPER_SECRET_TOKEN\":\"$API_KEY\"}" \
+            >/dev/null
+
+          echo "✅ Secret updated successfully"
+
+      - name: Update Lambda environment variables
+        env:
+          LAMBDA_NAME: ${{ needs.deploy.outputs.lambda-name }}
+          SECRET_ARN: ${{ needs.deploy.outputs.secret-arn }}
+        shell: bash
+        run: |
+          set +x
+          echo "🔧 Updating Lambda environment..."
+
+          # Recupera il token dal secret
+          TOKEN=$(aws secretsmanager get-secret-value \
+            --secret-id "$SECRET_ARN" \
+            --query SecretString --output text | jq -r '.SUPER_SECRET_TOKEN')
+          echo "::add-mask::$TOKEN"
+
+          # Aggiorna le variabili d'ambiente della Lambda
+          echo "📋 Getting current Lambda environment..."
+          CURRENT_ENV=$(aws lambda get-function-configuration \
+            --function-name "$LAMBDA_NAME" \
+            --query 'Environment.Variables' --output json 2>/dev/null || echo '{}')
+
+          echo "🔀 Merging environment variables..."
+          UPDATED_ENV=$(echo "$CURRENT_ENV" | jq --arg token "$TOKEN" '. + {DEMO_API_KEY: $token}')
+
+          # Crea il JSON corretto per AWS CLI (wrapped in Environment object)
+          ENV_JSON=$(jq -nc --argjson vars "$UPDATED_ENV" '{Variables: $vars}')
+
+          echo "🚀 Updating Lambda configuration..."
+          aws lambda update-function-configuration \
+            --function-name "$LAMBDA_NAME" \
+            --environment "$ENV_JSON" \
+            >/dev/null
+
+          echo "✅ Lambda environment updated successfully"
+
+      # ---- Advanced health check con skip opzionale ----
+      - name: Advanced health check with exponential backoff
+        if: github.event.inputs.skip_health_check != 'true' && needs.deploy.outputs.deployment-skipped != 'true'
+        env:
+          SERVICE_URL: ${{ needs.deploy.outputs.service-url }}
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          URL="${SERVICE_URL}/healthz"
+          echo "🏥 Starting health check for: $URL"
+
+          # Exponential backoff: 5s, 10s, 15s, 20s, 30s, 30s, 30s...
+          max_attempts=12
+          attempt=1
+
+          while [ $attempt -le $max_attempts ]; do
+            echo "🔍 Health check attempt $attempt/$max_attempts..."
+            
+            # Calcola il delay (cap a 30s)
+            delay=$((attempt < 6 ? attempt * 5 : 30))
+            
+            # Esegui il check
+            if response=$(curl -sf --connect-timeout 10 --max-time 15 "$URL" 2>&1); then
+              echo "✅ Service is healthy!"
+              echo "Response: $response"
+              exit 0
+            else
+              echo "❌ Health check failed (attempt $attempt/$max_attempts)"
+              if [ $attempt -lt $max_attempts ]; then
+                echo "⏳ Waiting ${delay}s before next attempt..."
+                sleep $delay
+              fi
+            fi
+            
+            ((attempt++))
+          done
+
+          echo "💥 Health check failed after $max_attempts attempts"
+          echo "🔍 Debugging info:"
+          curl -v --connect-timeout 5 --max-time 10 "$URL" || true
+          exit 1
+
+      - name: Health Check Summary
+        if: always()
+        run: |
+          if [ "${{ github.event.inputs.skip_health_check }}" == "true" ]; then
+            echo "🏥 **Health Check**: Skipped (manual override)" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.deploy.outputs.deployment-skipped }}" == "true" ]; then
+            echo "🏥 **Health Check**: Skipped (no deployment changes)" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ job.status }}" == "success" ]; then
+            echo "🏥 **Health Check**: ✅ Passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "🏥 **Health Check**: ❌ Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ---- Summary finale con retry info ----
+      - name: Deployment Summary
+        if: always()
+        run: |
+          echo "## 🎉 Deployment Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Status dei job
+          echo "### 📊 Job Status" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status | Notes |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Infrastructure | ${{ needs.infrastructure.result == 'success' && '✅' || '❌' }} | ${{ needs.infrastructure.outputs.cache-hit == 'true' && 'Cache hit' || 'Cache miss' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.build.result == 'success' && '✅' || '❌' }} | ${{ needs.build.outputs.build-skipped == 'true' && 'Skipped (exists)' || 'Built' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deploy | ${{ needs.deploy.result == 'success' && '✅' || '❌' }} | ${{ needs.deploy.outputs.deployment-skipped == 'true' && 'No changes' || 'Deployed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Finalize | ${{ job.status == 'success' && '✅' || '❌' }} | Health check + config |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Dettagli deployment
+          echo "### 🔧 Deployment Details" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Details |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Service URL** | ${{ needs.deploy.outputs.service-url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Docker Image** | ${{ needs.build.outputs.image-uri }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Lambda Function** | ${{ needs.deploy.outputs.lambda-name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **AWS Account** | ${{ needs.infrastructure.outputs.aws-account }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Region** | ${{ env.AWS_REGION }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Istruzioni per retry
+          if [ "${{ job.status }}" != "success" ] || [ "${{ needs.infrastructure.result }}" != "success" ] || [ "${{ needs.build.result }}" != "success" ] || [ "${{ needs.deploy.result }}" != "success" ]; then
+            echo "### 🔄 Re-run Failed Jobs" >> $GITHUB_STEP_SUMMARY
+            echo "To retry only failed jobs:" >> $GITHUB_STEP_SUMMARY
+            echo "1. Go to the [Actions tab](../actions)" >> $GITHUB_STEP_SUMMARY
+            echo "2. Select this workflow run" >> $GITHUB_STEP_SUMMARY  
+            echo "3. Click **'Re-run failed jobs'**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Or trigger manual run with options:" >> $GITHUB_STEP_SUMMARY
+            echo "- ☑️ **Force rebuild**: Ignore cache and rebuild everything" >> $GITHUB_STEP_SUMMARY
+            echo "- ☑️ **Skip health check**: Skip final health verification" >> $GITHUB_STEP_SUMMARY
+          fi

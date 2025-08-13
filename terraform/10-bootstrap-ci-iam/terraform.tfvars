@@ -1,0 +1,5 @@
+aws_region    = "eu-central-1"
+state_bucket  = "orbital-freight-tf-state"
+lock_table    = "orbital-freight-tf-locks"
+ecr_repo_name = "orbital-freight/podinfo"
+env           = "dev"
