@@ -21,7 +21,7 @@ resource "aws_lambda_function" "app" {
   image_uri     = var.image_uri
   role          = aws_iam_role.lambda_exec.arn
   architectures = [var.lambda_arch]
-  timeout       = 10
+  timeout       = 30
   publish       = true
   environment {
     variables = {
@@ -32,13 +32,14 @@ resource "aws_lambda_function" "app" {
   }
 }
 
+
 resource "aws_lambda_alias" "live" {
   name             = "live"
   function_name    = aws_lambda_function.app.function_name
-  function_version = "1"
+  function_version = aws_lambda_function.app.version
 
   lifecycle {
-    ignore_changes = [function_version]
+    ignore_changes = [function_version, routing_config]
   }
 }
 
@@ -51,8 +52,7 @@ resource "aws_lambda_permission" "apigw_live" {
   qualifier     = "live"
 
   depends_on = [
-    aws_apigatewayv2_stage.default
-  ]
+  aws_apigatewayv2_stage.default, aws_lambda_alias.live]
 }
 
 resource "aws_apigatewayv2_api" "api" {
