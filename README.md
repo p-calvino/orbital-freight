@@ -154,13 +154,14 @@ Monitora i deployment in tempo reale:
 ### Pipeline Stages
 
 ```mermaid
-
-    A [Push to main] --> B[Infrastructure Bootstrap]
+graph TD
+    A[Push to main] --> B[Infrastructure Bootstrap]
     A --> C[Go Lint & Test]
     B --> D[Build & Push Docker]
+    C --> D
     D --> E[Deploy Application]
     E --> F[Configure & Health Check]
-
+    F --> G[Blue/Green Switch]
 ```
 
 ### Ottimizzazioni
